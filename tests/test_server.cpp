@@ -55,9 +55,11 @@ static void run_suite(kv::ServerOptions::Mode mode) {
     send_all(fd, "SET msg hello big world\nGET msg\n");
     CHECK_EQ(read_lines(fd, 2), std::string("OK\nhello big world\n"));
     // TTL expiry is observed over the wire.
-    send_all(fd, "SET t v\nPEXPIRE t 20\n"); read_lines(fd, 2);
-    std::this_thread::sleep_for(std::chrono::milliseconds(120));
-    send_all(fd, "GET t\n"); CHECK_EQ(read_lines(fd, 1), std::string("(nil)\n"));
+    send_all(fd, "SET t v\nPEXPIRE t 20\nSET u v\nPEXPIRE u 20\n"); read_lines(fd, 4);
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    send_all(fd, "GET t\n"); CHECK_EQ(read_lines(fd, 1), std::string("(nil)\n"));  // lazy expiry on read
+    // `u` is never read, so only the background sweep can remove it — wait for it, don't assume timing.
+    for (int i = 0; i < 200 && stats.expired_swept.load() < 1; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
     CHECK(stats.expired_swept.load() >= 1);
     // QUIT closes the connection after replying.
     send_all(fd, "QUIT\n"); CHECK_EQ(read_lines(fd, 1), std::string("OK\n"));
