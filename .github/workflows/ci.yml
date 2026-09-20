@@ -13,7 +13,7 @@ jobs:
       - run: ctest --test-dir build --output-on-failure
       - name: smoke test over the wire
         run: |
-          ./build/kvserver --port 5600 --mode poll --aof ci.aof & sleep 0.5
+          ./build/kvserver --port 5600 --mode event --aof ci.aof & sleep 0.5
           printf 'SET a 1\nINCR a\nGET a\nPEXPIRE a 100\nTTL a\nINFO\nQUIT\n' | nc -w 2 127.0.0.1 5600
           ./build/kvbench --port 5600 --clients 10 --requests 20000 --pipeline 8
           kill -INT %1; wait %1

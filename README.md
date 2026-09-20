@@ -11,7 +11,7 @@ under ThreadSanitizer.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j && ctest --test-dir build
-./build/kvserver --mode poll --aof data.aof --fsync everysec        # port 5555
+./build/kvserver --aof data.aof --fsync everysec                    # port 5555; --mode event|poll|thread
 printf 'SET user:1 Abheenash Rajolu\nINCR visits\nPEXPIRE visits 60000\nTTL visits\nGET user:1\n' | nc localhost 5555
 ./build/kvbench --clients 50 --requests 1000000 --pipeline 32
 ```
@@ -32,6 +32,16 @@ Full matrix in [`results/bench-apple-m4.csv`](results/bench-apple-m4.csv); repro
 | 50% writes, **AOF `everysec`** | 184 K | 157 µs | 0.99 ms |
 | 50% writes, **AOF `always`** (fsync per write) | 84 K | 389 µs | 1.78 ms |
 | 50% writes, no AOF | 206 K | 171 µs | 0.94 ms |
+
+**kqueue / epoll vs poll** (`--mode event`, added later; [`results/bench-event-apple-m4.csv`](results/bench-event-apple-m4.csv)):
+
+| clients | poll req/s · p99 | kqueue req/s · p99 |
+| --- | --- | --- |
+| 50 | 199 K · 1.33 ms | 210 K · **0.63 ms** |
+| 500 | 210 K · 12.3 ms | **238 K** · **7.7 ms** |
+| 2,000 | 206 K · 39.6 ms | 201 K · **24.2 ms** |
+
+Throughput barely moves — the loopback client is the ceiling either way — but the tail halves: `poll()` hands the reactor every descriptor to scan on every wake-up, `kqueue` hands it only the ready ones, so an idle client stops costing the busy ones latency. The `epoll` variant runs in CI on Linux; both share one connection-servicing step with the `poll` loop, so the framing and half-close semantics are tested once.
 
 What those say:
 
@@ -73,7 +83,8 @@ it over the old log atomically.
 
 **Server** (`src/server.*`) — `--mode thread`: one OS thread per connection, blocking reads.
 `--mode poll`: N reactors, each running `poll()` over its own connections *and the shared
-listening socket*, so every reactor accepts for itself. Both batch all responses from one read
+listening socket*, so every reactor accepts for itself. `--mode event` (the default): the same
+reactors on **kqueue** (macOS/BSD) or **epoll** (Linux), O(ready) per wake-up instead of O(all). Both batch all responses from one read
 into one write (which is what makes pipelining fast) and both shut down gracefully on
 `SIGINT`/`SIGTERM` via `sigwait` (no async-signal-safety games).
 
@@ -119,6 +130,5 @@ docker build -t kvserver . && docker run -p 5555:5555 -v kvdata:/data kvserver
 
 ## What I'd do next
 
-`epoll`/`kqueue` backends behind the same reactor interface (`poll()` is O(n) per wake-up; fine
-at 500 connections, not at 50,000), a proper RESP encoding so real Redis clients can talk to it,
-and replication — ship the AOF stream to a follower.
+A proper RESP encoding so real Redis clients can talk to it, and replication — ship the AOF
+stream to a follower. (The `epoll`/`kqueue` backend that used to head this list is in.)

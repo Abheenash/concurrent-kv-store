@@ -5,7 +5,10 @@
 //   poll    — N reactor threads, each running poll() over its own connections
 //             AND the shared listening socket, so each reactor accepts for itself
 //             (non-blocking accept; the losers of the race just get EAGAIN). Idle
-//             clients cost a pollfd, not a thread.
+//             clients cost a pollfd, not a thread — but every wake-up scans all of them.
+//   event   — the same reactors on kqueue (macOS/BSD) or epoll (Linux): the kernel
+//             hands back only the descriptors that are ready, so a wake-up costs
+//             O(active connections) instead of O(all connections).
 //
 // Both models read into a per-connection LineParser, dispatch every complete
 // line, and batch all the responses from one read into one write — which is what
@@ -30,8 +33,8 @@ namespace kv {
 struct ServerOptions {
     std::string bind = "0.0.0.0";
     std::uint16_t port = 5555;       // 0 = ephemeral (tests)
-    enum class Mode { Thread, Poll } mode = Mode::Poll;
-    int io_threads = 0;              // poll mode; 0 = hardware_concurrency()
+    enum class Mode { Thread, Poll, Event } mode = Mode::Event;
+    int io_threads = 0;              // poll/event modes; 0 = hardware_concurrency()
     std::size_t max_line = 1 << 20;  // a client that sends 1 MB without a newline is dropped
     int sweep_ms = 1000;             // expired-key sweep interval; 0 = off
 };
@@ -44,15 +47,23 @@ public:
     void start();                    // bind, listen, spawn threads; throws on failure
     void stop();                     // graceful: stop accepting, close clients, join
     std::uint16_t port() const noexcept { return port_; }
-    static const char* mode_name(ServerOptions::Mode m) { return m == ServerOptions::Mode::Thread ? "thread-per-connection" : "poll"; }
+    static const char* mode_name(ServerOptions::Mode m);
 
 private:
     struct Reactor;
+    struct ConnState {
+        LineParser parser;
+        std::string out;  // unsent response bytes
+        bool close_after_flush = false;  // QUIT, or the peer half-closed: flush, then close
+    };
     void accept_loop();
     std::vector<int> drain_accept();
     void sweep_loop();
     void serve_blocking(int fd);                       // thread mode
     void reactor_loop(Reactor& r);                     // poll mode
+    void event_loop(Reactor& r);                       // event mode (kqueue / epoll)
+    // Shared per-connection step for both reactors. Returns true when the connection is finished.
+    bool service_conn(int fd, struct ConnState& c, bool readable, bool writable, bool hangup, char* buf, std::size_t buflen);
     bool process_input(LineParser& parser, const char* data, std::size_t n, std::string& out, bool& close);
 
     ServerOptions opts_;

@@ -109,5 +109,6 @@ int main() {
     std::signal(SIGPIPE, SIG_IGN);
     run_suite(kv::ServerOptions::Mode::Thread);
     run_suite(kv::ServerOptions::Mode::Poll);
+    run_suite(kv::ServerOptions::Mode::Event);
     return 0;
 }

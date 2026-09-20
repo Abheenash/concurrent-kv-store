@@ -1,6 +1,6 @@
 // kvserver — a concurrent TCP key-value store.
 //
-//   kvserver [--port 5555] [--bind 0.0.0.0] [--mode poll|thread] [--io-threads N]
+//   kvserver [--port 5555] [--bind 0.0.0.0] [--mode event|poll|thread] [--io-threads N]
 //            [--shards N] [--aof path] [--fsync always|everysec|no] [--sweep-ms N]
 //
 // Talk to it with nc:   printf 'SET a 1\nINCR a\nGET a\n' | nc localhost 5555
@@ -20,7 +20,7 @@
 namespace {
 void usage() {
     std::fprintf(stderr,
-        "usage: kvserver [--port 5555] [--bind 0.0.0.0] [--mode poll|thread] [--io-threads N]\n"
+        "usage: kvserver [--port 5555] [--bind 0.0.0.0] [--mode event|poll|thread] [--io-threads N]\n"
         "                [--shards N] [--aof path] [--fsync always|everysec|no] [--sweep-ms N]\n");
 }
 }  // namespace
@@ -40,6 +40,7 @@ int main(int argc, char** argv) {
             std::string m = next();
             if (m == "poll") so.mode = kv::ServerOptions::Mode::Poll;
             else if (m == "thread") so.mode = kv::ServerOptions::Mode::Thread;
+            else if (m == "event" || m == "kqueue" || m == "epoll") so.mode = kv::ServerOptions::Mode::Event;
             else { usage(); return 2; }
         }
         else if (k == "--io-threads") so.io_threads = std::atoi(next());
@@ -67,7 +68,7 @@ int main(int argc, char** argv) {
     kv::Stats stats;
     std::unique_ptr<kv::Aof> aof;
     std::string mode_info = std::string(kv::Server::mode_name(so.mode)) +
-        (so.mode == kv::ServerOptions::Mode::Poll ? " x" + std::to_string(so.io_threads > 0 ? so.io_threads : (int)std::thread::hardware_concurrency()) : "");
+        (so.mode != kv::ServerOptions::Mode::Thread ? " x" + std::to_string(so.io_threads > 0 ? so.io_threads : (int)std::thread::hardware_concurrency()) : "");
     if (!aof_path.empty()) aof = std::make_unique<kv::Aof>(aof_path, fsync);
     kv::Dispatcher dispatcher(store, stats, aof.get(), mode_info);
     if (aof) {

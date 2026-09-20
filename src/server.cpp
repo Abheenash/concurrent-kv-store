@@ -7,6 +7,11 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#if defined(__APPLE__) || defined(__FreeBSD__)
+#include <sys/event.h>
+#else
+#include <sys/epoll.h>
+#endif
 
 #include <cerrno>
 #include <cstring>
@@ -49,15 +54,25 @@ bool write_all(int fd, const std::string& s) {
 // new fds through `pending` and writes one byte to the pipe so poll() returns.
 struct Server::Reactor {
     int wake_r = -1, wake_w = -1;
+    int kq = -1;  // kqueue / epoll descriptor (event mode)
     std::thread thread;
-    struct Conn {
-        LineParser parser;
-        std::string out;  // unsent response bytes
-        bool close_after_flush = false;  // QUIT, or the peer half-closed: flush, then close
-    };
-    std::unordered_map<int, Conn> conns;
-    std::vector<pollfd> fds;
+    std::unordered_map<int, ConnState> conns;
+    std::vector<pollfd> fds;  // poll mode
 };
+
+const char* Server::mode_name(ServerOptions::Mode m) {
+    switch (m) {
+        case ServerOptions::Mode::Thread: return "thread-per-connection";
+        case ServerOptions::Mode::Poll: return "poll";
+        case ServerOptions::Mode::Event:
+#if defined(__APPLE__) || defined(__FreeBSD__)
+            return "kqueue";
+#else
+            return "epoll";
+#endif
+    }
+    return "?";
+}
 
 Server::Server(ServerOptions opts, Store& store, Dispatcher& dispatcher, Stats& stats)
     : opts_(std::move(opts)), store_(store), dispatcher_(dispatcher), stats_(stats) {}
@@ -83,7 +98,8 @@ void Server::start() {
     ::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len);
     port_ = ntohs(addr.sin_port);
 
-    if (opts_.mode == ServerOptions::Mode::Poll) {
+    if (opts_.mode != ServerOptions::Mode::Thread) {
+        const bool ev = opts_.mode == ServerOptions::Mode::Event;
         int n = opts_.io_threads > 0 ? opts_.io_threads : static_cast<int>(std::thread::hardware_concurrency());
         if (n < 1) n = 1;
         for (int i = 0; i < n; ++i) {
@@ -96,7 +112,9 @@ void Server::start() {
             r->fds.push_back(pollfd{listen_fd_, POLLIN, 0});  // every reactor accepts
             reactors_.push_back(std::move(r));
         }
-        for (auto& r : reactors_) r->thread = std::thread([this, &r] { reactor_loop(*r); });
+        for (auto& r : reactors_) {
+            r->thread = ev ? std::thread([this, &r] { event_loop(*r); }) : std::thread([this, &r] { reactor_loop(*r); });
+        }
     } else {
         acceptor_ = std::thread([this] { accept_loop(); });
     }
@@ -239,14 +257,14 @@ void Server::reactor_loop(Reactor& r) {
         if (r.fds[1].revents & POLLIN) {
             for (int fd : drain_accept()) {
                 set_nonblocking(fd);
-                r.conns.emplace(fd, Reactor::Conn{});
+                r.conns.emplace(fd, ConnState{});
                 r.fds.push_back(pollfd{fd, POLLIN, 0});
             }
         }
 
         for (std::size_t i = 2; i < r.fds.size();) {
             pollfd& p = r.fds[i];
-            Reactor::Conn& c = r.conns[p.fd];
+            ConnState& c = r.conns[p.fd];
             bool dead = false;
 
             // POLLHUP can arrive together with POLLIN while unread bytes are still
@@ -300,5 +318,148 @@ void Server::reactor_loop(Reactor& r) {
     r.fds.resize(2);
     r.conns.clear();
 }
+
+
+// ---------------------------------------------------------------- shared connection step
+bool Server::service_conn(int fd, ConnState& c, bool readable, bool writable, bool hangup, char* buf, std::size_t buflen) {
+    bool dead = false;
+    // A hangup can arrive with unread bytes still buffered (a client that sent and
+    // half-closed, like nc). Read first; read() returning 0 is what ends the input side.
+    if (readable || hangup) {
+        while (true) {
+            ssize_t n = ::read(fd, buf, buflen);
+            if (n > 0) {
+                bool close = false;
+                process_input(c.parser, buf, static_cast<std::size_t>(n), c.out, close);
+                if (close) { c.close_after_flush = true; break; }
+                continue;
+            }
+            if (n == 0) { c.close_after_flush = true; break; }
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            dead = true; break;
+        }
+    }
+    if (!dead && !c.out.empty() && (writable || readable || hangup)) {
+        ssize_t n = ::write(fd, c.out.data(), c.out.size());
+        if (n > 0) c.out.erase(0, static_cast<std::size_t>(n));
+        else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) dead = true;
+    }
+    if (!dead && c.close_after_flush && c.out.empty()) dead = true;
+    return dead;
+}
+
+// ---------------------------------------------------------------- event mode
+#if defined(__APPLE__) || defined(__FreeBSD__)
+
+void Server::event_loop(Reactor& r) {
+    char buf[16384];
+    r.kq = ::kqueue();
+    auto want = [&](int fd, bool read, bool write) {
+        struct kevent ch[2];
+        EV_SET(&ch[0], static_cast<uintptr_t>(fd), EVFILT_READ, read ? EV_ADD : EV_DELETE, 0, 0, nullptr);
+        EV_SET(&ch[1], static_cast<uintptr_t>(fd), EVFILT_WRITE, write ? EV_ADD : EV_DELETE, 0, 0, nullptr);
+        ::kevent(r.kq, ch, 2, nullptr, 0, nullptr);  // EV_DELETE of an absent filter just returns ENOENT
+    };
+    want(r.wake_r, true, false);
+    want(listen_fd_, true, false);
+    auto drop = [&](int fd) {
+        ::close(fd);  // closing removes its kevents
+        r.conns.erase(fd);
+        stats_.connections_open.fetch_sub(1, std::memory_order_relaxed);
+    };
+
+    struct kevent evs[128];
+    while (true) {
+        int n = ::kevent(r.kq, nullptr, 0, evs, 128, nullptr);
+        if (n < 0) { if (errno == EINTR) continue; break; }
+        bool stop = false;
+        for (int i = 0; i < n; ++i) {
+            const int fd = static_cast<int>(evs[i].ident);
+            if (fd == r.wake_r) {
+                while (::read(r.wake_r, buf, sizeof buf) > 0) {}
+                if (stopping_.load()) stop = true;
+                continue;
+            }
+            if (fd == listen_fd_) {
+                for (int nfd : drain_accept()) {
+                    set_nonblocking(nfd);
+                    r.conns.emplace(nfd, ConnState{});
+                    want(nfd, true, false);
+                }
+                continue;
+            }
+            auto it = r.conns.find(fd);
+            if (it == r.conns.end()) continue;  // dropped earlier in this batch
+            ConnState& c = it->second;
+            const bool readable = evs[i].filter == EVFILT_READ;
+            const bool writable = evs[i].filter == EVFILT_WRITE;
+            const bool hangup = (evs[i].flags & EV_EOF) != 0;
+            if (service_conn(fd, c, readable, writable, hangup, buf, sizeof buf)) { drop(fd); continue; }
+            want(fd, !c.close_after_flush, !c.out.empty());
+        }
+        if (stop) break;
+    }
+    for (auto& [fd, c] : r.conns) { ::close(fd); stats_.connections_open.fetch_sub(1, std::memory_order_relaxed); }
+    r.conns.clear();
+    ::close(r.kq); r.kq = -1;
+}
+
+#else
+
+void Server::event_loop(Reactor& r) {
+    char buf[16384];
+    r.kq = ::epoll_create1(EPOLL_CLOEXEC);
+    auto ctl = [&](int op, int fd, uint32_t events) {
+        epoll_event ev{}; ev.events = events; ev.data.fd = fd;
+        ::epoll_ctl(r.kq, op, fd, &ev);
+    };
+    ctl(EPOLL_CTL_ADD, r.wake_r, EPOLLIN);
+    ctl(EPOLL_CTL_ADD, listen_fd_, EPOLLIN);
+    auto drop = [&](int fd) {
+        ::epoll_ctl(r.kq, EPOLL_CTL_DEL, fd, nullptr);
+        ::close(fd);
+        r.conns.erase(fd);
+        stats_.connections_open.fetch_sub(1, std::memory_order_relaxed);
+    };
+
+    epoll_event evs[128];
+    while (true) {
+        int n = ::epoll_wait(r.kq, evs, 128, -1);
+        if (n < 0) { if (errno == EINTR) continue; break; }
+        bool stop = false;
+        for (int i = 0; i < n; ++i) {
+            const int fd = evs[i].data.fd;
+            const uint32_t e = evs[i].events;
+            if (fd == r.wake_r) {
+                while (::read(r.wake_r, buf, sizeof buf) > 0) {}
+                if (stopping_.load()) stop = true;
+                continue;
+            }
+            if (fd == listen_fd_) {
+                for (int nfd : drain_accept()) {
+                    set_nonblocking(nfd);
+                    r.conns.emplace(nfd, ConnState{});
+                    ctl(EPOLL_CTL_ADD, nfd, EPOLLIN | EPOLLRDHUP);
+                }
+                continue;
+            }
+            auto it = r.conns.find(fd);
+            if (it == r.conns.end()) continue;
+            ConnState& c = it->second;
+            if (e & EPOLLERR) { drop(fd); continue; }
+            const bool readable = (e & EPOLLIN) != 0;
+            const bool writable = (e & EPOLLOUT) != 0;
+            const bool hangup = (e & (EPOLLHUP | EPOLLRDHUP)) != 0;
+            if (service_conn(fd, c, readable, writable, hangup, buf, sizeof buf)) { drop(fd); continue; }
+            ctl(EPOLL_CTL_MOD, fd, (c.close_after_flush ? 0u : (EPOLLIN | EPOLLRDHUP)) | (c.out.empty() ? 0u : EPOLLOUT));
+        }
+        if (stop) break;
+    }
+    for (auto& [fd, c] : r.conns) { ::close(fd); stats_.connections_open.fetch_sub(1, std::memory_order_relaxed); }
+    r.conns.clear();
+    ::close(r.kq); r.kq = -1;
+}
+#endif
 
 }  // namespace kv
