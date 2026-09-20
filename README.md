@@ -1,5 +1,7 @@
 # concurrent-kv-store
 
+> **Sep 2026 (v2):** Redis-style server — sharded store with TTLs, 22 commands, AOF persistence, thread / poll / kqueue-epoll I/O, 5.09 M req/s pipelined, kqueue halves p99 vs poll, five macOS socket bugs found by its own tests.
+
 A Redis-style in-memory key-value server in C++17 on raw POSIX sockets: a **sharded store**
 with reader/writer locks and **per-key TTLs**, a newline-framed protocol with a real command
 set, **append-only-file persistence** with replay and compaction, **two I/O models** you can
