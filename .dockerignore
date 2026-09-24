@@ -1,0 +1,29 @@
+# The build context is the repository root and the Dockerfile does `COPY . .`,
+# so without this file the ENTIRE repo — including .git — is copied into the
+# build stage. The final image is multi-stage and only takes the two binaries,
+# but the build layer still contains the full history, and anything ever
+# committed is recoverable from it. That is the classic way a secret that was
+# "removed in a later commit" ends up inside a published image.
+.git/
+.github/
+
+# Build output — rebuilt inside the container anyway, and copying a host build
+# in risks linking against the wrong libc.
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+compile_commands.json
+
+# Not needed to compile: docs, benchmark results, editor and tooling config.
+docs/
+results/
+*.md
+LICENSE
+.clang-tidy
+.editorconfig
+.pre-commit-config.yaml
+.gitignore
+Dockerfile
+.dockerignore
